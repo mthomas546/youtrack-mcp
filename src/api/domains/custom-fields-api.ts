@@ -5,6 +5,7 @@
 
 import { BaseAPIClient, MCPResponse } from '../base/base-client.js';
 import { ResponseFormatter } from '../base/response-formatter.js';
+import { convertToPeriodValue, isPeriodField } from '../../utils/period-value.js';
 
 export interface CustomFieldCreateParams {
   name: string;
@@ -369,23 +370,71 @@ export class CustomFieldsAPIClient extends BaseAPIClient {
 
   /**
    * Update issue custom field value
+   * 
+   * For Period fields (e.g., Estimation, Spent time), accepts multiple formats:
+   * - Minutes as integer: 240
+   * - Hours string: "4h" or "4 hours"  
+   * - Days string: "2d" or "2 days"
+   * - ISO 8601: "PT4H", "PT4H30M"
+   * - Object: { minutes: 240 }
    */
   async updateIssueCustomFieldValue(issueId: string, fieldId: string, value: any): Promise<MCPResponse> {
     try {
-      const endpoint = `/issues/${issueId}/customFields/${fieldId}`;
-      const data = { value };
+      // First, get the field info to determine its type
+      const fieldEndpoint = `/issues/${issueId}/customFields/${fieldId}`;
+      const fieldInfoResponse = await this.axios.get(fieldEndpoint, {
+        params: { fields: 'id,name,$type,value($type)' }
+      });
+      
+      const fieldInfo = fieldInfoResponse.data;
+      const fieldType = fieldInfo?.$type || '';
+      const fieldName = fieldInfo?.name || '';
+      
+      // Check if this is a Period field
+      const isPeriod = fieldType.includes('Period') || isPeriodField(fieldName, fieldType);
+      
+      let processedValue = value;
+      
+      if (isPeriod) {
+        const periodValue = convertToPeriodValue(value);
+        if (periodValue === null) {
+          return ResponseFormatter.formatError(
+            `Invalid period value: "${value}". Accepted formats: ` +
+            `minutes as integer (240), hours string ("4h"), ` +
+            `days string ("2d"), ISO 8601 ("PT4H"), or object ({ minutes: 240 })`
+          );
+        }
+        processedValue = periodValue;
+      }
+      
+      const data = { value: processedValue };
 
-      const response = await this.axios.post(endpoint, data, {
+      const response = await this.axios.post(fieldEndpoint, data, {
         params: {
-          fields: 'id,name,value(id,name,presentation,$type)'
+          fields: 'id,name,$type,value(id,name,presentation,minutes,$type)'
         }
       });
       
       return ResponseFormatter.formatSuccess(
         response.data,
-        `Updated custom field ${fieldId} for issue ${issueId}`
+        `Updated custom field ${fieldName || fieldId} for issue ${issueId}`
       );
     } catch (error: any) {
+      // Provide helpful error message for Period field type mismatches
+      if (error.response?.status === 400 && error.response?.data) {
+        const errorData = error.response.data;
+        const errorMessage = typeof errorData === 'string' ? errorData : JSON.stringify(errorData);
+        
+        if (errorMessage.toLowerCase().includes('period') || errorMessage.toLowerCase().includes('minutes')) {
+          return ResponseFormatter.formatError(
+            `Period field update failed: ${error.message}. ` +
+            `For Period fields, provide duration in one of these formats: ` +
+            `minutes as integer (240), hours string ("4h" or "4 hours"), ` +
+            `days string ("2d" or "2 days"), ISO 8601 ("PT4H"), or object ({ minutes: 240 })`,
+            error
+          );
+        }
+      }
       return ResponseFormatter.formatError(`Failed to update issue custom field: ${error.message}`, error);
     }
   }

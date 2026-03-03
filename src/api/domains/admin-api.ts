@@ -2,6 +2,7 @@ import { BaseAPIClient, MCPResponse } from '../base/base-client.js';
 import { ResponseFormatter } from '../base/response-formatter.js';
 import { FieldSelector } from '../../utils/field-selector.js';
 import { PerformanceMonitor } from '../../utils/performance-monitor.js';
+import { convertToPeriodValue, isPeriodField, formatPeriodValue } from '../../utils/period-value.js';
 
 export interface ProjectCreateParams {
   name: string;
@@ -1525,6 +1526,13 @@ export class AdminAPIClient extends BaseAPIClient {
 
   /**
    * Bulk update issues
+   * 
+   * For Period fields (Estimation, Spent time, etc.), accepts multiple formats:
+   * - Minutes as integer: 240
+   * - Hours string: "4h" or "4 hours"
+   * - Days string: "2d" or "2 days"
+   * - ISO 8601: "PT4H", "PT4H30M"
+   * - Object: { minutes: 240 }
    */
   async bulkUpdateIssues(issueIds: string[], updates: any): Promise<MCPResponse> {
     if (!issueIds || issueIds.length === 0) {
@@ -1532,17 +1540,87 @@ export class AdminAPIClient extends BaseAPIClient {
     }
 
     const results: any[] = [];
-  const errors: any[] = [];
+    const errors: any[] = [];
+    const periodFieldsConverted: string[] = [];
+
+    // Pre-process updates to handle Period fields
+    // First, get field information from the first issue to detect field types
+    let fieldInfoCache: Map<string, { isPeriod: boolean; name: string }> = new Map();
+    
+    try {
+      if (updates.customFields && Array.isArray(updates.customFields)) {
+        // If updates contain customFields array, check each for Period type
+        const firstIssueId = issueIds[0];
+        const fieldsEndpoint = `/issues/${firstIssueId}/customFields`;
+        const fieldsResponse = await this.axios.get(fieldsEndpoint, {
+          params: { fields: 'id,name,$type,projectCustomField(field(fieldType($type,id)))' }
+        });
+        
+        const issueFields = fieldsResponse.data || [];
+        for (const field of issueFields) {
+          const fieldType = field.projectCustomField?.field?.fieldType?.$type || field.$type || '';
+          fieldInfoCache.set(field.id, {
+            isPeriod: fieldType.includes('Period') || isPeriodField(field.name || '', fieldType),
+            name: field.name || ''
+          });
+          fieldInfoCache.set(field.name?.toLowerCase() || '', {
+            isPeriod: fieldType.includes('Period') || isPeriodField(field.name || '', fieldType),
+            name: field.name || ''
+          });
+        }
+      }
+    } catch (e) {
+      // If we can't get field info, we'll still try to detect Period fields by name
+    }
+
+    // Process updates - convert Period field values
+    const processedUpdates = JSON.parse(JSON.stringify(updates)); // Deep clone
+    
+    if (processedUpdates.customFields && Array.isArray(processedUpdates.customFields)) {
+      for (const customField of processedUpdates.customFields) {
+        const fieldId = customField.id || customField.name;
+        const cachedInfo = fieldInfoCache.get(fieldId) || fieldInfoCache.get(fieldId?.toLowerCase());
+        const isPeriod = cachedInfo?.isPeriod || isPeriodField(customField.name || fieldId || '', customField.$type);
+        
+        if (isPeriod && customField.value !== undefined && customField.value !== null) {
+          const periodValue = convertToPeriodValue(customField.value);
+          if (periodValue) {
+            customField.value = periodValue;
+            periodFieldsConverted.push(cachedInfo?.name || fieldId);
+          }
+        }
+      }
+    }
+    
+    // Also handle direct field updates (e.g., { "Estimation": "4h" })
+    for (const [key, value] of Object.entries(processedUpdates)) {
+      if (key === 'customFields') continue;
+      
+      const cachedInfo = fieldInfoCache.get(key) || fieldInfoCache.get(key.toLowerCase());
+      const isPeriod = cachedInfo?.isPeriod || isPeriodField(key, undefined);
+      
+      if (isPeriod && value !== undefined && value !== null) {
+        const periodValue = convertToPeriodValue(value);
+        if (periodValue) {
+          processedUpdates[key] = { value: periodValue };
+          periodFieldsConverted.push(cachedInfo?.name || key);
+        }
+      }
+    }
 
     for (const issueId of issueIds) {
       try {
         const endpoint = `/issues/${issueId}`;
-        await this.axios.post(endpoint, updates);
+        await this.axios.post(endpoint, processedUpdates);
         results.push({ issueId, status: 'updated' });
       } catch (error: any) {
         errors.push({ issueId, error: error.message });
       }
     }
+
+    const message = periodFieldsConverted.length > 0
+      ? `Bulk update completed: ${results.length}/${issueIds.length} issues updated. Period fields converted: ${[...new Set(periodFieldsConverted)].join(', ')}`
+      : `Bulk update completed: ${results.length}/${issueIds.length} issues updated`;
 
     return ResponseFormatter.formatSuccess({
       updated: results,
@@ -1550,9 +1628,10 @@ export class AdminAPIClient extends BaseAPIClient {
       summary: {
         total: issueIds.length,
         successful: results.length,
-        failed: errors.length
+        failed: errors.length,
+        periodFieldsConverted: [...new Set(periodFieldsConverted)]
       }
-    }, `Bulk update completed: ${results.length}/${issueIds.length} issues updated`);
+    }, message);
   }
 
   /**
